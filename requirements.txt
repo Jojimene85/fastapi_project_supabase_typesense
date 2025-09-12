@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+pydantic
+
+sqlalchemy
+psycopg[binary]
+
+pandas
+pyarrow
+typesense
+python-dotenv
+python-multipart>=0.0.9,<0.1.0
+asyncpg
+
+typing_extensions
+requests
+httpx

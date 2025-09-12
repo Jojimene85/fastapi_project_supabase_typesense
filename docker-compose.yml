@@ -1,0 +1,161 @@
+# docker-compose.yml
+
+name: pwc_entrevista
+
+services:
+  # --- 0) Init de permisos del lake (necesario en Windows/Mac para que Airflow pueda escribir) ---
+  lake-init:
+    image: alpine:3.20
+    command: >
+      sh -lc "
+        mkdir -p /lake/bronze /lake/silver /lake/gold &&
+        chmod -R 0777 /lake
+      "
+    volumes:
+      - ./lake:/lake
+    networks: [pwcnet]
+    restart: "no"
+
+  # --- 1) Typesense (buscador / vector index) ---
+  typesense:
+    image: typesense/typesense:0.25.2
+    command: >
+      /opt/typesense-server
+      --data-dir=/data
+      --api-key=${TYPESENSE_API_KEY}
+      --listen-port=8108
+      --peering-port=8107
+      --enable-cors
+    ports:
+      - "8108:8108"
+    environment:
+      TYPESENSE_DATA_DIR: /data
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
+      TYPESENSE_ENABLE_CORS: "true"
+    volumes:
+      - ./typesense-data:/data:rw
+    networks: [pwcnet]
+    restart: unless-stopped
+    # Nota: no ponemos healthcheck interno (la imagen no trae curl/wget).
+    # Probamos salud desde otros servicios (scheduler) o desde el host.
+
+  # --- 2) Airflow Scheduler ---
+  airflow-scheduler:
+    image: apache/airflow:2.10.2-python3.12
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+    environment:
+      PYTHONPATH: /opt/airflow/ext:/opt/airflow/dags:/opt/airflow/api
+      PYTHONDONTWRITEBYTECODE: "1"
+      _PIP_ADDITIONAL_REQUIREMENTS: "-r /requirements.txt"
+      ENABLE_TYPESENSE_INDEX: "1"  
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////lake/airflow.db
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "False"
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
+      AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL} 
+      # Rutas lakehouse para el DAG
+      BRONZE_DIR: /lake/bronze
+      SILVER_DIR: /lake/silver
+      GOLD_DIR: /lake/gold
+      # Typesense para tareas que indexan
+      TYPESENSE_PROTOCOL: http
+      TYPESENSE_HOST: typesense
+      TYPESENSE_PORT: "8108"
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
+      TYPESENSE_SEARCH_KEY: ${TYPESENSE_SEARCH_KEY}
+    env_file:
+      - .env
+    command: ["airflow", "scheduler"]
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./orchestration:/opt/airflow/ext/orchestration:ro
+      - ./common:/opt/airflow/ext/common:ro
+      - ./api:/opt/airflow/api:ro
+      - ./etl:/opt/airflow/ext/etl:ro
+      - ./lake:/lake:rw
+      - ./requirements.txt:/requirements.txt:ro
+    #  - ./airflow-logs:/opt/airflow/logs:rw
+
+    networks:
+      - pwcnet
+    restart: unless-stopped
+
+  # --- 3) Airflow Webserver ---
+  airflow-webserver:
+    image: apache/airflow:2.10.2-python3.12
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+      airflow-scheduler:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    environment:
+      PYTHONPATH: /opt/airflow/ext:/opt/airflow/dags:/opt/airflow/api
+      PYTHONDONTWRITEBYTECODE: "1"
+      _PIP_ADDITIONAL_REQUIREMENTS: "-r /requirements.txt"
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////lake/airflow.db
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY}
+      AIRFLOW__LOGGING__REMOTE_LOGGING: "False"
+      AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+      AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
+      AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
+      AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL}  # Si usás Supabase, para el plugin de usuarios
+    command: ["airflow", "webserver"]
+    volumes:
+      - ./dags:/opt/airflow/dags:ro
+      - ./orchestration:/opt/airflow/ext/orchestration:ro
+      - ./common:/opt/airflow/ext/common:ro
+      - ./api:/opt/airflow/api:ro
+      - ./etl:/opt/airflow/ext/etl:ro
+      - ./lake:/lake:rw
+      - ./requirements.txt:/requirements.txt:ro
+    #  - ./airflow-logs:/opt/airflow/logs:rw
+    networks:
+      - pwcnet
+    restart: unless-stopped
+
+  # --- 4) API (FastAPI / Uvicorn) ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+      typesense:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      # Typesense para la API
+      TYPESENSE_PROTOCOL: http
+      TYPESENSE_HOST: typesense
+      TYPESENSE_PORT: "8108"
+      TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
+      TYPESENSE_SEARCH_KEY: ${TYPESENSE_SEARCH_KEY}
+      # Si usás Supabase, estos pasan de tu .env
+      SUPABASE_DB_URL: ${SUPABASE_DB_URL}
+    env_file:
+      - .env
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./:/app
+      - ./lake:/lake:rw
+    networks:
+      - pwcnet
+    restart: unless-stopped
+
+networks:
+  pwcnet: {}
+

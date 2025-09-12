@@ -1,0 +1,28 @@
+# carpetas de logs (Airflow)
+airflow-logs/
+logs/
+**/logs/**
+**/__pycache__/**
+**/*.pyc
+
+# entornos locales y cache
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# VCS / editor / env
+.git/
+.gitignore
+.vscode/
+.idea/
+.env
+.env.*
+
+# archivos grandes que no van a la imagen
+*.log
+*.csv
+*.parquet
+*.xlsx
+*.pdf
