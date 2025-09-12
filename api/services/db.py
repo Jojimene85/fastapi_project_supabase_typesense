@@ -11,10 +11,11 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
 DB_URL = os.getenv("SUPABASE_DB_URL")
 
 def get_engine():
-    if not DB_URL:
+    db_url = os.getenv("SUPABASE_DB_URL")
+    if not db_url:
         raise RuntimeError("SUPABASE_DB_URL no configurado")
     # pool_pre_ping evita conexiones muertas
-    return create_engine(DB_URL, pool_pre_ping=True, echo=False)
+    return create_engine(db_url, pool_pre_ping=True, echo=False)
 
 def get_async_engine() -> AsyncEngine:
     db_url = os.getenv("SUPABASE_DB_URL")

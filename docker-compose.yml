@@ -42,6 +42,8 @@ services:
   # --- 2) Airflow Scheduler ---
   airflow-scheduler:
     image: apache/airflow:2.10.2-python3.12
+    env_file:
+      - .env
     depends_on:
       lake-init:
         condition: service_completed_successfully
@@ -59,7 +61,7 @@ services:
       AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
       AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
       AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
-      SUPABASE_DB_URL: ${SUPABASE_DB_URL} 
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require 
       # Rutas lakehouse para el DAG
       BRONZE_DIR: /lake/bronze
       SILVER_DIR: /lake/silver
@@ -70,8 +72,6 @@ services:
       TYPESENSE_PORT: "8108"
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
       TYPESENSE_SEARCH_KEY: ${TYPESENSE_SEARCH_KEY}
-    env_file:
-      - .env
     command: ["airflow", "scheduler"]
     volumes:
       - ./dags:/opt/airflow/dags:ro
@@ -95,6 +95,8 @@ services:
         condition: service_completed_successfully
       airflow-scheduler:
         condition: service_started
+    env_file:
+      - .env
     ports:
       - "8080:8080"
     environment:
@@ -110,7 +112,7 @@ services:
       AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
       AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
       AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
-      SUPABASE_DB_URL: ${SUPABASE_DB_URL}  # Si usás Supabase, para el plugin de usuarios
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require
     command: ["airflow", "webserver"]
     volumes:
       - ./dags:/opt/airflow/dags:ro
@@ -145,7 +147,7 @@ services:
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
       TYPESENSE_SEARCH_KEY: ${TYPESENSE_SEARCH_KEY}
       # Si usás Supabase, estos pasan de tu .env
-      SUPABASE_DB_URL: ${SUPABASE_DB_URL}
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require
     env_file:
       - .env
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

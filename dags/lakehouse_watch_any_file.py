@@ -148,7 +148,7 @@ with DAG(
     wait_for_bronze = PythonSensor(
         task_id="wait_for_bronze_updates",
         python_callable=wait_for_bronze_updates,
-        poke_interval=15,
+        poke_interval=60,
         timeout=60 * 60 * 24,
         mode="reschedule",
         doc="Espera cambios en archivos CSV del layer Bronze.",

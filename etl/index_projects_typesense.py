@@ -39,10 +39,12 @@ def _text_hash(s: str) -> str:
 
 def _concat_text(row: pd.Series) -> str:
     # Ajustá campos según tu DF
-    title = str(row.get("title") or "")
-    abstract = str(row.get("abstract") or "")
-    country = str(row.get("country") or "")
-    year = str(row.get("year") or "")
+    def safe_str(val):
+        return str(val) if not pd.isna(val) else ""
+    title = safe_str(row.get("title"))
+    abstract = safe_str(row.get("abstract"))
+    country = safe_str(row.get("country"))
+    year = safe_str(row.get("year"))
     return " | ".join([title, abstract, country, year]).strip()
 
 def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
@@ -63,8 +65,8 @@ def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
     raise RuntimeError(f"Formato inesperado del embedder: {data}")
 
 def _ensure_schema(engine: Engine) -> None:
+    import logging
     with engine.begin() as conn:
-        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {SEARCH_TABLE} (
                 project_id    BIGINT PRIMARY KEY,
@@ -77,15 +79,28 @@ def _ensure_schema(engine: Engine) -> None:
             )
         """))
         # Índices recomendados (usá uno u otro, o ambos según volumen/latencia)
-        conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_ivf_idx') THEN "
-                          f"CREATE INDEX {SEARCH_TABLE}_ivf_idx ON {SEARCH_TABLE} USING ivfflat (embedding vector_l2_ops) WITH (lists = 100); END IF; END $$;"))
-        conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_hnsw_idx') THEN "
-                          f"CREATE INDEX {SEARCH_TABLE}_hnsw_idx ON {SEARCH_TABLE} USING hnsw (embedding vector_l2_ops); END IF; END $$;"))
+        try:
+            conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_ivf_idx') THEN "
+                              f"CREATE INDEX {SEARCH_TABLE}_ivf_idx ON {SEARCH_TABLE} USING ivfflat (embedding vector_l2_ops) WITH (lists = 100); END IF; END $$;"))
+        except Exception as e:
+            logging.warning(f"No se pudo crear el índice ivfflat: {e}")
+        try:
+            conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_hnsw_idx') THEN "
+                              f"CREATE INDEX {SEARCH_TABLE}_hnsw_idx ON {SEARCH_TABLE} USING hnsw (embedding vector_l2_ops); END IF; END $$;"))
+        except Exception as e:
+            logging.warning(f"No se pudo crear el índice hnsw: {e}")
 
 def _fetch_existing_hashes(engine: Engine) -> Dict[int, str]:
+    import sqlalchemy
     with engine.begin() as conn:
-        res = conn.execute(text(f"SELECT project_id, text_hash FROM {SEARCH_TABLE}"))
-        return {int(r.project_id): r.text_hash for r in res.fetchall()}
+        try:
+            res = conn.execute(text(f"SELECT project_id, text_hash FROM {SEARCH_TABLE}"))
+            return {int(r.project_id): r.text_hash for r in res.fetchall()}
+        except sqlalchemy.exc.ProgrammingError as e:
+            if 'does not exist' in str(e):
+                _ensure_schema(engine)
+                return {}
+            raise
 
 def _upsert_rows(engine: Engine, rows: List[Tuple[int, str, str, str, int, str, List[float]]]) -> int:
     if not rows:
