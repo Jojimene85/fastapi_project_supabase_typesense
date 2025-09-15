@@ -84,3 +84,4 @@ def get_search_client() -> typesense.Client:
 # - Usamos admin por defecto (init/index necesitan permisos).
 client = get_admin_client()
 
+

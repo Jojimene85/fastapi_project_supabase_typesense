@@ -4,7 +4,8 @@ Punto de entrada de FastAPI: registra routers.
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.routes import seed, raw, gold, search
+from api.routes import seed, raw, gold, search, test
+
 
 app = FastAPI(title="PWC Entrevista API")
 
@@ -30,5 +31,6 @@ def health():
 
 app.include_router(raw.router)
 app.include_router(gold.router)
-#app.include_router(search.router)
+app.include_router(search.router)
 app.include_router(seed.router)
+app.include_router(test.router)

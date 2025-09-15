@@ -1,209 +1,128 @@
-# api/routes/search.py
-"""
-SEARCH: endpoints de búsqueda sobre el data warehouse.
-- GET /search/typesense : busca documentos en Typesense (texto o vector si la colección tiene 'embedding').
-- GET /search/pgvector  : busca en Supabase/Postgres usando pgvector para similitud semántica.
-"""
-
-from __future__ import annotations
-
+# search.py
+from fastapi import APIRouter, HTTPException, Query
 import os
-from typing import List, Optional, Any, Dict
-
+import json
 import httpx
-from fastapi import APIRouter, Query, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import text
-from anyio import to_thread
 
-# Reusar servicios centralizados
-from api.services.db import get_async_engine  # async engine (Supabase PG)
-from api.services.typesense_client import get_admin_client  # cliente Typesense (sync)
+router = APIRouter()
 
-router = APIRouter(prefix="/search", tags=["search"])
+# --- Config desde variables de entorno ---
+TS_HOST = os.getenv("TYPESENSE_HOST", "typesense")
+TS_PORT = os.getenv("TYPESENSE_PORT", "8108")
+TS_PROTO = os.getenv("TYPESENSE_PROTOCOL", "http")
+TS_KEY = os.getenv("TYPESENSE_API_KEY")
+TS_COLL = os.getenv("TYPESENSE_COLLECTION", "project_search")
 
-# ---------- Config ----------
-TYPESENSE_COLLECTION = os.getenv("TYPESENSE_COLLECTION", "projects")
-SEARCH_TABLE = os.getenv("SEARCH_TABLE", "project_search")
-
-# Embeddings (SOLO Supabase Edge Function)
 SUPABASE_EMBED_URL = os.getenv("SUPABASE_EMBED_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+VERIFY_SSL = os.getenv("HTTPX_VERIFY", "1") != "0"  # poné HTTPX_VERIFY=0 para PoC sin cert
 
 
-# ---------- Modelos ----------
-class Hit(BaseModel):
-    id: str
-    project_id: int
-    title: str = ""
-    abstract: str = ""
-    country: Optional[str] = None
-    year: Optional[int] = None
-    text: Optional[str] = None
-    score: Optional[float] = Field(None, description="Similarity / relevance score")
-    source: str = Field(..., description="typesense | pgvector")
-
-
-class SearchResponse(BaseModel):
-    query: str
-    k: int
-    hits: List[Hit]
-
-
-# ---------- Helpers ----------
-async def _embed_query(texts: List[str]) -> List[List[float]]:
-    if not SUPABASE_EMBED_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise HTTPException(
-            503,
-            "Embeddings no configurados. Definí SUPABASE_EMBED_URL y SUPABASE_SERVICE_ROLE_KEY",
-        )
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            SUPABASE_EMBED_URL,
-            headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"inputs": texts},
-        )
-    r.raise_for_status()
-    data = r.json()
-    # Edge function típica devuelve {"embeddings":[...]}
-    if isinstance(data, dict) and "embeddings" in data:
-        return data["embeddings"]
-    if isinstance(data, list):  # por si devuelve directamente la lista
-        return data
-    raise HTTPException(500, f"Formato inesperado del embedder: {data}")
-
-
-# =========================================================
-#                  /search/typesense
-# =========================================================
-@router.get("/typesense", response_model=SearchResponse)
-async def search_typesense(
-    q: str = Query(..., description="Query de búsqueda"),
-    k: int = Query(10, ge=1, le=200),
-    country: Optional[str] = Query(None),
-    year: Optional[int] = Query(None),
-    use_vector: bool = Query(False, description="Activa similaridad si la colección tiene campo 'embedding'"),
-):
-    """
-    Búsqueda en Typesense: por texto y, opcionalmente, por vector (si la colección TS tiene 'embedding').
-    El cliente oficial es sincrónico → lo corremos en thread para no bloquear el loop.
-    """
-    ts = get_admin_client()
-
-    def _filters() -> Optional[str]:
-        parts = []
-        if country:
-            parts.append(f"country:={country}")
-        if year is not None:
-            parts.append(f"year:={year}")
-        return " && ".join(parts) if parts else None
-
-    if use_vector:
-        [vec] = await _embed_query([q])
-
-        def _do_search_vec() -> Dict[str, Any]:
-            params: Dict[str, Any] = {
-                "q": q,
-                "query_by": "title,abstract,text",
-                "per_page": k,
-                "vector_query": f"embedding:=[{','.join(map(str, vec))}]",
-            }
-            fb = _filters()
-            if fb:
-                params["filter_by"] = fb
-            return ts.collections[TYPESENSE_COLLECTION].documents.search(params)
-
-        raw = await to_thread.run_sync(_do_search_vec)
-
-    else:
-        def _do_search_text() -> Dict[str, Any]:
-            params: Dict[str, Any] = {
-                "q": q,
-                "query_by": "title,abstract,text",
-                "per_page": k,
-            }
-            fb = _filters()
-            if fb:
-                params["filter_by"] = fb
-            return ts.collections[TYPESENSE_COLLECTION].documents.search(params)
-
-        raw = await to_thread.run_sync(_do_search_text)
-
-    hits: List[Hit] = []
-    for item in raw.get("hits", []):
-        doc = item.get("document", {})
-        score = item.get("text_match") or item.get("vector_distance")
-        hits.append(Hit(
-            id=str(doc.get("id")),
-            project_id=int(doc.get("project_id", 0)),
-            title=doc.get("title", "") or "",
-            abstract=doc.get("abstract", "") or "",
-            country=doc.get("country"),
-            year=doc.get("year"),
-            text=doc.get("text"),
-            score=float(score) if score is not None else None,
-            source="typesense",
-        ))
-
-    return SearchResponse(query=q, k=k, hits=hits)
-
-
-# =========================================================
-#                  /search/pgvector
-# =========================================================
-@router.get("/pgvector", response_model=SearchResponse)
-async def search_pgvector(
-    q: str = Query(...),
-    k: int = Query(10, ge=1, le=200),
-    country: Optional[str] = Query(None),
-    year: Optional[int] = Query(None),
-):
-    """
-    Búsqueda semántica en Supabase/Postgres usando pgvector:
-      SELECT ... ORDER BY embedding <-> :qvec LIMIT :k
-    Reusa el AsyncEngine de db.py.
-    """
-    [vec] = await _embed_query([q])
-    vec_sql = f"[{','.join(map(str, vec))}]"
-
-    filters = []
+def _build_filter_by(country: str | None, year_min: int | None, year_max: int | None) -> str:
+    parts: list[str] = []
     if country:
-        filters.append("country = :country")
-    if year is not None:
-        filters.append("year = :year")
-    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        parts.append(f"country:={country}")
+    if year_min is not None:
+        parts.append(f"year:>={year_min}")
+    if year_max is not None:
+        parts.append(f"year:<={year_max}")
+    return " && ".join(parts)
 
-    sql = f"""
-        SELECT project_id, title, abstract, country, year
-        FROM {SEARCH_TABLE}
-        {where}
-        ORDER BY embedding <-> :qvec
-        LIMIT :k
+
+def _format_hits_only(raw: dict) -> list[dict]:
     """
+    Devuelve solo la lista de hits, con campos útiles + highlights (si los hay).
+    """
+    results = raw.get("results", [])
+    hits = results[0].get("hits", []) if results else []
 
-    engine = get_async_engine()
-    async with engine.connect() as conn:
-        res = await conn.execute(
-            text(sql),
-            {"qvec": vec_sql, "k": k, "country": country, "year": year},
-        )
-        rows = [dict(r._mapping) for r in res.fetchall()]
+    def highlights_map(h: dict) -> dict:
+        out = {}
+        for hl in h.get("highlights", []):
+            field = hl.get("field")
+            snippet = hl.get("snippet")
+            if field and snippet:
+                out[field] = snippet
+        return out
 
-    hits = [
-        Hit(
-            id=str(r["project_id"]),
-            project_id=int(r["project_id"]),
-            title=r.get("title") or "",
-            abstract=r.get("abstract") or "",
-            country=r.get("country"),
-            year=r.get("year"),
-            text=None,
-            score=None,  # si querés score: SELECT (1 - (embedding <-> :qvec)) AS score
-            source="pgvector",
-        )
-        for r in rows
-    ]
-    return SearchResponse(query=q, k=k, hits=hits)
+    out_hits: list[dict] = []
+    for h in hits:
+        doc = h.get("document", {})
+        dist = h.get("vector_distance")
+        sim = None
+        if dist is not None:
+            try:
+                sim = round(1.0 - float(dist), 6)  # PoC simple
+            except Exception:
+                sim = None
+
+        out_hits.append({
+            "id": doc.get("id"),
+            "project_id": doc.get("project_id"),
+            "title": doc.get("title"),
+            "abstract": doc.get("abstract"),
+            "country": doc.get("country"),
+            "year": doc.get("year"),
+            "similarity": sim,
+            "highlights": highlights_map(h),  # p.ej. { "title": "...", "abstract": "..." }
+        })
+    return out_hits
+
+
+@router.get("/search/typesense")
+async def search_typesense(
+    q: str = Query(..., description="Consulta del usuario"),
+    k: int = Query(5, ge=1, le=50, description="Cantidad de resultados"),
+    # por defecto híbrido (texto + vector) así obtenés highlights útiles
+    vector_only: bool = Query(False, description="True = vector puro; False = híbrido (BM25 + vector)"),
+    country: str | None = Query(None, description="Filtro exacto por país, ej: AR"),
+    year_min: int | None = Query(None, ge=0, description="Año mínimo (>=)"),
+    year_max: int | None = Query(None, ge=0, description="Año máximo (<=)"),
+):
+    if not SUPABASE_EMBED_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_EMBED_URL no configurada")
+
+    # 1) Embedding del query (Supabase Function)
+    try:
+        async with httpx.AsyncClient(timeout=30.0, verify=VERIFY_SSL) as s:
+            er = await s.post(SUPABASE_EMBED_URL, json={"inputs": [q]})
+            er.raise_for_status()
+            emb = (er.json().get("embeddings") or [])[0]
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Error llamando a embed: {e}")
+
+    # 2) Multi-search (v0.25.x) con highlights y sin devolver 'embedding'
+    url = f"{TS_PROTO}://{TS_HOST}:{TS_PORT}/multi_search?collection={TS_COLL}"
+    filter_by = _build_filter_by(country, year_min, year_max)
+
+    search_obj: dict = {
+        "q": "*" if vector_only else q,
+        "query_by": "title,abstract",
+        "per_page": k,
+        "include_fields": "id,project_id,title,abstract,country,year",  # solo lo que necesitamos
+        "exclude_fields": "embedding",
+        "vector_query": f"embedding:({json.dumps(emb)}, k:{k})",
+    }
+
+    # highlights (tiene más sentido en híbrido; igual no molesta si vector_only=True)
+    search_obj["highlight_full_fields"] = "title,abstract"
+    search_obj["highlight_affix_num_tokens"] = 8
+    search_obj["snippet_threshold"] = 30
+
+    if filter_by:
+        search_obj["filter_by"] = filter_by
+
+    payload = {"searches": [search_obj]}
+    headers = {"X-TYPESENSE-API-KEY": TS_KEY, "Content-Type": "application/json"}
+
+    # 3) Ejecutar y devolver solo los hits formateados
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=VERIFY_SSL) as s:
+            r = await s.post(url, headers=headers, json=payload)
+        if r.status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Typesense 404 en {url}")
+        r.raise_for_status()
+        raw = r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Error en Typesense: {e}")
+
+    return _format_hits_only(raw)

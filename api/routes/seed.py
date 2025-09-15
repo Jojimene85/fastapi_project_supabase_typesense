@@ -1,7 +1,8 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException, status
 import requests
 import os
 from requests.auth import HTTPBasicAuth
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 router = APIRouter(prefix="/seed", tags=["seed"])
 
@@ -10,8 +11,10 @@ DAG_ID = "lakehouse_full_run"
 AIRFLOW_USER = os.getenv("AIRFLOW_ADMIN_USER", "airflow")
 AIRFLOW_PASS = os.getenv("AIRFLOW_ADMIN_PASSWORD", "admin")
 
+security = HTTPBasic()
+
 @router.post("/")
-def seed_everything():
+def seed_everything(credentials: HTTPBasicCredentials = Depends(security)):
     """Trigger Airflow DAG for full load + vectorization."""
     url = f"{AIRFLOW_URL}/dags/{DAG_ID}/dagRuns"
     headers = {"Content-Type": "application/json"}
@@ -22,7 +25,7 @@ def seed_everything():
             url,
             json=payload,
             headers=headers,
-            auth=HTTPBasicAuth(AIRFLOW_USER, AIRFLOW_PASS)
+            auth=HTTPBasicAuth(credentials.username, credentials.password)
         )
         print("Airflow response:", resp.status_code, resp.text)  # <-- print después del request
         resp.raise_for_status()

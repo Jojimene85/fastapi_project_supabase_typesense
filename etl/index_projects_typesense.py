@@ -8,185 +8,159 @@ INDEX PROJECTS → Genera/actualiza embeddings en Supabase (pgvector) a partir d
 - Devuelve métricas (indexed, seconds, timestamp)
 """
 
-from __future__ import annotations
-
 import os
 import time
-import hashlib
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
-import httpx
 import pandas as pd
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
+import asyncio
+import httpx
 
-# Reusar engine sync desde tus servicios
-from api.services.db import get_engine  # Engine síncrono para ETL
+from api.services.typesense_client import get_admin_client
 
-# ---------- Config lectura ----------
-GOLD_DIR = os.getenv("GOLD_DIR", "/lake/gold")
-PROJECTS_PARQUET = os.getenv("PROJECTS_PARQUET", os.path.join(GOLD_DIR, "dim_project.parquet"))
-SEARCH_TABLE = os.getenv("SEARCH_TABLE", "project_search")
-EMBED_DIMS = int(os.getenv("EMBEDDING_DIMS", "384"))
+# =====================
+# Config
+# =====================
+TYPESENSE_COLLECTION = os.getenv("TYPESENSE_COLLECTION", "project_search")
+TS_VECTOR_DISTANCE = os.getenv("TS_VECTOR_DISTANCE", "cosine")  # cosine|l2|dotproduct
+EMBED_DIMS = int(os.getenv("EMBED_DIMS", "384"))
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
 
-# ---------- Embeddings (Supabase Edge) ----------
 SUPABASE_EMBED_URL = os.getenv("SUPABASE_EMBED_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
-def _text_hash(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _concat_text(row: pd.Series) -> str:
-    # Ajustá campos según tu DF
-    def safe_str(val):
-        return str(val) if not pd.isna(val) else ""
-    title = safe_str(row.get("title"))
-    abstract = safe_str(row.get("abstract"))
-    country = safe_str(row.get("country"))
-    year = safe_str(row.get("year"))
-    return " | ".join([title, abstract, country, year]).strip()
+# =====================
+# Embeddings (Supabase Function)
+# =====================
+async def _embed_http(texts: List[str]) -> List[List[float]]:
+    if not SUPABASE_EMBED_URL:
+        raise RuntimeError("SUPABASE_EMBED_URL no configurada")
 
-def _embed_batch_sync(texts: List[str]) -> List[List[float]]:
-    if not SUPABASE_EMBED_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Embeddings no configurados (SUPABASE_EMBED_URL, SUPABASE_SERVICE_ROLE_KEY).")
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post(
-            SUPABASE_EMBED_URL,
-            headers={"Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}", "Content-Type": "application/json"},
-            json={"inputs": texts},
-        )
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, dict) and "embeddings" in data:
-        return data["embeddings"]
-    if isinstance(data, list):
+    headers = {"Content-Type": "application/json"}
+    if SUPABASE_SERVICE_ROLE_KEY:
+        headers["Authorization"] = f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
+
+    payload = {"inputs": texts}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(SUPABASE_EMBED_URL, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        # Soporta {"embeddings": [...]} o lista directa
+        if isinstance(data, dict) and "embeddings" in data:
+            return data["embeddings"]
         return data
-    raise RuntimeError(f"Formato inesperado del embedder: {data}")
 
-def _ensure_schema(engine: Engine) -> None:
-    import logging
-    with engine.begin() as conn:
-        conn.execute(text(f"""
-            CREATE TABLE IF NOT EXISTS {SEARCH_TABLE} (
-                project_id    BIGINT PRIMARY KEY,
-                title         TEXT,
-                abstract      TEXT,
-                country       TEXT,
-                year          INT,
-                text_hash     TEXT NOT NULL,
-                embedding     VECTOR({EMBED_DIMS})
-            )
-        """))
-        # Índices recomendados (usá uno u otro, o ambos según volumen/latencia)
+
+def embed_batch_sync(texts: List[str]) -> List[List[float]]:
+    return asyncio.run(_embed_http(texts))
+
+
+# =====================
+# Typesense: schema mínimo (PoC)
+# =====================
+def _ensure_collection(ts, dims: int):
+    """
+    Mínimo útil para PoC:
+      - id, project_id, title, abstract, embedding
+      - (Opcional) country/year como facet si querés filtrar (dejados activos)
+    """
+    schema_v026 = {
+        "name": TYPESENSE_COLLECTION,
+        "fields": [
+            {"name": "id", "type": "string"},
+            {"name": "project_id", "type": "int64"},
+            {"name": "title", "type": "string"},
+            {"name": "abstract", "type": "string"},
+            {"name": "country", "type": "string", "facet": True},
+            {"name": "year", "type": "int32", "facet": True},
+            {"name": "embedding", "type": "float[]"},
+        ],
+        "vectors": [
+            {"name": "embedding", "size": dims, "distance": TS_VECTOR_DISTANCE}
+        ],
+    }
+    try:
+        ts.collections[TYPESENSE_COLLECTION].retrieve()
+    except Exception:
         try:
-            conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_ivf_idx') THEN "
-                              f"CREATE INDEX {SEARCH_TABLE}_ivf_idx ON {SEARCH_TABLE} USING ivfflat (embedding vector_l2_ops) WITH (lists = 100); END IF; END $$;"))
+            ts.collections.create(schema_v026)
         except Exception as e:
-            logging.warning(f"No se pudo crear el índice ivfflat: {e}")
-        try:
-            conn.execute(text(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = '{SEARCH_TABLE}_hnsw_idx') THEN "
-                              f"CREATE INDEX {SEARCH_TABLE}_hnsw_idx ON {SEARCH_TABLE} USING hnsw (embedding vector_l2_ops); END IF; END $$;"))
-        except Exception as e:
-            logging.warning(f"No se pudo crear el índice hnsw: {e}")
+            # Fallback para Typesense 0.25 (solo un vector)
+            if "unknown field: vectors" in str(e).lower():
+                schema_v025 = dict(schema_v026)
+                schema_v025["vector"] = {"size": dims, "distance": TS_VECTOR_DISTANCE}
+                schema_v025.pop("vectors", None)
+                ts.collections.create(schema_v025)
+            else:
+                raise
 
-def _fetch_existing_hashes(engine: Engine) -> Dict[int, str]:
-    import sqlalchemy
-    with engine.begin() as conn:
-        try:
-            res = conn.execute(text(f"SELECT project_id, text_hash FROM {SEARCH_TABLE}"))
-            return {int(r.project_id): r.text_hash for r in res.fetchall()}
-        except sqlalchemy.exc.ProgrammingError as e:
-            if 'does not exist' in str(e):
-                _ensure_schema(engine)
-                return {}
-            raise
 
-def _upsert_rows(engine: Engine, rows: List[Tuple[int, str, str, str, int, str, List[float]]]) -> int:
-    if not rows:
-        return 0
-    # PG vector requiere casting explícito para arrays → usamos formato '[...]'
-    with engine.begin() as conn:
-        sql = text(f"""
-            INSERT INTO {SEARCH_TABLE} (project_id, title, abstract, country, year, text_hash, embedding)
-            VALUES (:project_id, :title, :abstract, :country, :year, :text_hash, :embedding::vector)
-            ON CONFLICT (project_id) DO UPDATE
-            SET title = EXCLUDED.title,
-                abstract = EXCLUDED.abstract,
-                country = EXCLUDED.country,
-                year = EXCLUDED.year,
-                text_hash = EXCLUDED.text_hash,
-                embedding = EXCLUDED.embedding
-        """)
-        payload = []
-        for pid, title, abstract, country, year, thash, vec in rows:
-            vec_sql = f"[{','.join(map(str, vec))}]"
-            payload.append({
-                "project_id": pid,
-                "title": title,
-                "abstract": abstract,
-                "country": country,
-                "year": year if year is not None else None,
-                "text_hash": thash,
-                "embedding": vec_sql,
-            })
-        conn.execute(sql, payload)
-    return len(rows)
+# =====================
+# Fuente de datos (ajustá a tu realidad)
+# =====================
+def _fetch_projects_df() -> pd.DataFrame:
+    """
+    Reemplazá por tu loader real (Postgres/Parquet/CSV, etc.).
+    Debe devolver columnas: project_id, title, abstract, country, year
+    """
+    # Placeholder vacío para que completes
+    return pd.DataFrame([], columns=["project_id", "title", "abstract", "country", "year"])
 
+
+# =====================
+# Entrypoint
+# =====================
 def main() -> Dict[str, Any]:
     start = time.time()
 
-    # 1) Leer DF desde lake/gold
-    df = pd.read_parquet(PROJECTS_PARQUET)
-    # normalizar columnas esperadas
-    expected = ["projectID", "title", "abstract", "country", "year"]
-    for col in expected:
-        if col not in df.columns:
-            df[col] = None
+    df = _fetch_projects_df()
+    if df.empty:
+        return {
+            "indexed": 0,
+            "seconds": round(time.time() - start, 1),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
-    df = df.rename(columns={"projectID": "project_id"})
-    df["country"] = df.get("country")  # ya existe en tu set
-    # 2) Generar texto + hash
-    df["__text"] = df.apply(_concat_text, axis=1)
-    df["__hash"] = df["__text"].map(_text_hash)
+    ts = get_admin_client()
+    _ensure_collection(ts, EMBED_DIMS)
 
-    engine = get_engine()
-    _ensure_schema(engine)
+    docs: List[Dict[str, Any]] = []
 
-    # 3) Buscar existentes para evitar recomputar
-    existing = _fetch_existing_hashes(engine)  # project_id -> hash
-    to_compute = df[
-        (df["project_id"].notna()) &
-        (~df["project_id"].astype(int).isin(existing.keys()) |
-         (df["project_id"].astype(int).map(existing).fillna("") != df["__hash"]))
-    ].copy()
+    for i in range(0, len(df), EMBED_BATCH):
+        chunk = df.iloc[i:i + EMBED_BATCH]
+        texts = [f"{str(row.get('title') or '')} {str(row.get('abstract') or '')}".strip()
+                 for _, row in chunk.iterrows()]
+        vecs = embed_batch_sync(texts)
 
-    # 4) Embeddings por lotes
-    BATCH = int(os.getenv("EMBED_BATCH", "128"))
-    inserts: List[Tuple[int, str, str, str, int, str, List[float]]] = []
-
-    for i in range(0, len(to_compute), BATCH):
-        chunk = to_compute.iloc[i:i+BATCH]
-        texts = chunk["__text"].tolist()
-        vecs = _embed_batch_sync(texts)
         for (idx, row), vec in zip(chunk.iterrows(), vecs):
-            inserts.append((
-                int(row["project_id"]),
-                str(row.get("title") or ""),
-                str(row.get("abstract") or ""),
-                str(row.get("country") or "") if row.get("country") is not None else None,
-                int(row.get("year")) if pd.notna(row.get("year")) else None,
-                str(row["__hash"]),
-                vec,
-            ))
+            pid = row.get("project_id")
+            if pd.isna(pid):
+                continue
+            pid = int(pid)
+            title = str(row.get("title") or "")
+            abstract = str(row.get("abstract") or "")
 
-    # 5) Upsert
-    n = _upsert_rows(engine, inserts)
+            doc = {
+                "id": str(pid),
+                "project_id": pid,
+                "title": title,
+                "abstract": abstract,
+                "country": (str(row.get("country") or "") or None),
+                "year": (int(row.get("year")) if pd.notna(row.get("year")) else None),
+                "embedding": vec,
+            }
+            docs.append(doc)
 
-    elapsed = time.time() - start
+    if docs:
+        ts.collections[TYPESENSE_COLLECTION].documents().import_(
+            docs, {"action": "upsert", "batch_size": 100}
+        )
+
     return {
-        "indexed": int(n),
-        "seconds": round(elapsed, 1),
+        "indexed": int(len(docs)),
+        "seconds": round(time.time() - start, 1),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

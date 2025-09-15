@@ -4,14 +4,21 @@ pydantic
 
 sqlalchemy
 psycopg[binary]
+psycopg2-binary
 
 pandas
 pyarrow
 typesense
 python-dotenv
 python-multipart>=0.0.9,<0.1.0
+
+# Solo si usas SQLAlchemy async
 asyncpg
 
 typing_extensions
 requests
 httpx
+
+pytest
+pytest-mock
+mock

@@ -32,6 +32,7 @@ services:
       TYPESENSE_DATA_DIR: /data
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
       TYPESENSE_ENABLE_CORS: "true"
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.doqluprsbmytwcqxvans:%23m.E2exKfR%25%40HQa@aws-1-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
     volumes:
       - ./typesense-data:/data:rw
     networks: [pwcnet]
@@ -50,7 +51,7 @@ services:
     environment:
       PYTHONPATH: /opt/airflow/ext:/opt/airflow/dags:/opt/airflow/api
       PYTHONDONTWRITEBYTECODE: "1"
-      _PIP_ADDITIONAL_REQUIREMENTS: "-r /requirements.txt"
+      _PIP_ADDITIONAL_REQUIREMENTS: "typesense pandas pyarrow"
       ENABLE_TYPESENSE_INDEX: "1"  
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
@@ -61,7 +62,7 @@ services:
       AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
       AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
       AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
-      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require 
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.doqluprsbmytwcqxvans:%23m.E2exKfR%25%40HQa@aws-1-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
       # Rutas lakehouse para el DAG
       BRONZE_DIR: /lake/bronze
       SILVER_DIR: /lake/silver
@@ -102,7 +103,7 @@ services:
     environment:
       PYTHONPATH: /opt/airflow/ext:/opt/airflow/dags:/opt/airflow/api
       PYTHONDONTWRITEBYTECODE: "1"
-      _PIP_ADDITIONAL_REQUIREMENTS: "-r /requirements.txt"
+      _PIP_ADDITIONAL_REQUIREMENTS: "typesense pandas pyarrow"
       AIRFLOW__CORE__EXECUTOR: SequentialExecutor
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////lake/airflow.db
@@ -112,7 +113,7 @@ services:
       AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME: ${AIRFLOW__LOGGING__DEFAULT_UI_LOG_HOSTNAME}
       AIRFLOW__LOGGING__WORKER_LOG_SERVER_PORT: "8793"
       AIRFLOW__API__AUTH_BACKENDS: airflow.providers.fab.auth_manager.api.auth.backend.basic_auth
-      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.doqluprsbmytwcqxvans:%23m.E2exKfR%25%40HQa@aws-1-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
     command: ["airflow", "webserver"]
     volumes:
       - ./dags:/opt/airflow/dags:ro
@@ -140,6 +141,8 @@ services:
     ports:
       - "8000:8000"
     environment:
+      PYTHONPATH: /app
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary"
       # Typesense para la API
       TYPESENSE_PROTOCOL: http
       TYPESENSE_HOST: typesense
@@ -147,7 +150,7 @@ services:
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY}
       TYPESENSE_SEARCH_KEY: ${TYPESENSE_SEARCH_KEY}
       # Si usás Supabase, estos pasan de tu .env
-      SUPABASE_DB_URL: postgresql+psycopg2://postgres.ptdhlneagtutmcfmapby:%23m.E2exKfR%25%40HQa@aws-1-us-east-1.pooler.supabase.com:6543/postgres?sslmode=require
+      SUPABASE_DB_URL: postgresql+psycopg2://postgres.doqluprsbmytwcqxvans:%23m.E2exKfR%25%40HQa@aws-1-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
     env_file:
       - .env
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
